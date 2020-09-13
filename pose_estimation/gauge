@@ -1,0 +1,588 @@
+#!/usr/bin/env python
+
+"""
+This file starts a ROS node to run DOPE Performance Gauge,
+publishing to an image topic and subscribing resulting poses.
+"""
+
+from __future__ import print_function
+
+import glob
+import json
+import math
+import os
+import time
+
+import cv2
+import numpy as np
+import rospy
+from PIL import ImageDraw
+from PIL import ImageFont
+from camera_info_manager import CameraInfoManager
+from cv_bridge import CvBridge, CvBridgeError
+from sensor_msgs.msg import Image, CameraInfo
+from vision_msgs.msg import Detection3DArray
+
+from geometry_msgs.msg import Point
+from dope.msg import ProjectedCuboidArray
+from dope.msg import ProjectedCuboid
+
+from munkres import Munkres, print_matrix
+
+try:
+    import queue
+except ImportError:
+    import Queue as queue
+
+class Result:
+
+    def __init__(self, id, image=None, cuboids=None, detections=None):
+        self.id = id
+        self.image = image
+        self.cuboids = cuboids
+        self.detections = detections
+
+    def is_complete(self):
+        return self.image and self.cuboids and self.detections
+
+class DopePerformanceGauge:
+
+    def __init__(self):
+        self.image_dir = rospy.get_param('~image_dir')
+        self.image_output_dir = rospy.get_param('~image_output_dir')
+        self.current_dir = ''
+        self.topic_camera_info = rospy.get_param('~topic_camera_info',
+                                                 '/dope/gauge/camera_info')
+        self.topic_image = rospy.get_param('~topic_image',
+                                           '/dope/gauge/image_raw')
+        self.topic_incoming_image = '/dope/rgb_points'
+        self.image_pub = rospy.Publisher(self.topic_image, Image, queue_size=144)
+        self.info_pub = rospy.Publisher(self.topic_camera_info, CameraInfo,
+                                        queue_size=144)
+
+        rospy.loginfo('Publishing images to {}.'.format(self.topic_image))
+        rospy.loginfo('Subscribing to incoming images from {}.'.format(
+            self.topic_incoming_image))
+        rospy.loginfo('Publishing camera_infos to {}.'.format(self.topic_camera_info))
+        rospy.loginfo('Saving Images to{}.'.format(self.image_output_dir))
+
+        self.bridge = CvBridge()
+        self.munkres = Munkres()
+
+        self.cuboid_que = queue.Queue()
+        self.image_que = queue.Queue()
+        self.detection_que = queue.Queue()
+
+        self.test_data = {} # {image_filename : annotation_filename}
+
+        self.images = {}
+        self.detections = {}
+        self.cuboids = {}
+
+        self.camera_info = None
+        self.publish_counter = 0
+        self.subscribe_counter = 0
+        self.processed_images = 0
+        self.lost_images = []
+
+        self.sub_rgb = rospy.Subscriber(self.topic_incoming_image, Image,
+                                     self._image_callback)
+        self.sub_cuboids = rospy.Subscriber( '/dope/cuboid_array',
+                                     ProjectedCuboidArray, self._cuboid_callback)
+        self.sub_objects = rospy.Subscriber('/dope/detected_objects',
+                                    Detection3DArray, self._detection_callback)
+
+        self.reset_local_metric_results()
+
+        self.global_TP_5 = 0
+        self.global_FP_5 = 0
+        self.global_FN_5 = 0
+
+        self.global_TP_10 = 0
+        self.global_FP_10 = 0
+        self.global_FN_10 = 0
+
+        self.global_TP_15 = 0
+        self.global_FP_15 = 0
+        self.global_FN_15 = 0
+
+    def run(self):
+        self._read_cam_info()
+        #rospy.loginfo([x[0] for x in os.walk(self.image_dir)][1:])
+        for self.current_dir in [x[0] for x in os.walk(self.image_dir)][1:]:
+            self.current_relative_dir = self.current_dir.split('/')[-1]
+            self.test_data = {}
+            self._fetch_test_data()
+            self.rate = rospy.Rate(3)
+
+            for image_filename in self.test_data:
+                i = 0
+                while (self.publish_counter - self.subscribe_counter) > 5:
+                    self.rate.sleep()
+                    if i % 50 == 0:
+                        rospy.logdebug('Delay publishing until new data arrives.')
+                    i += 1
+
+                image = cv2.imread(image_filename)
+                image_message = self.bridge.cv2_to_imgmsg(image, "bgr8")
+                assert len(image_filename) > 10
+                image_id = image_filename[-11:-4]
+                self.lost_images.append(image_id)
+
+                image_message.header.frame_id = image_id
+                image_message.header.stamp = rospy.Time.now()
+
+                self.camera_info.header = image_message.header
+                self.info_pub.publish(self.camera_info)
+                self.image_pub.publish(image_message)
+                rospy.logdebug('Published image {} and camera_info!'.format(
+                    image_message.header.frame_id))
+                self.publish_counter += 1
+                self.empty_queues()
+                self.rate.sleep()
+
+                if self.images:
+                    self._process_image()
+
+            # final evaluation
+            time.sleep(3)
+            self.empty_queues()
+            if self.images:
+                self._process_image()
+
+            self.save_metric_results()
+            self.reset_local_metric_results()
+
+    def reset_local_metric_results(self):
+        self.TP_5 = 0
+        self.FP_5 = 0
+        self.FN_5 = 0
+
+        self.TP_10 = 0
+        self.FP_10 = 0
+        self.FN_10 = 0
+
+        self.TP_15 = 0
+        self.FP_15 = 0
+        self.FN_15 = 0
+
+
+    def save_metric_results(self):
+        self.global_TP_5 +=  self.TP_5
+        self.global_FN_5 += self.FN_5
+        self.global_FP_5 += self.FP_5
+
+        self.global_TP_10 +=  self.TP_10
+        self.global_FN_10 += self.FN_10
+        self.global_FP_10 += self.FP_10
+
+        self.global_TP_15 +=  self.TP_15
+        self.global_FN_15 += self.FN_15
+        self.global_FP_15 += self.FP_15
+
+        precision_15 = recall_15 = precision_10 = recall_10 = precision_5 = recall_5 = 0
+
+        if (float(self.TP_15) + self.FP_15) >0:
+            precision_15 = float(self.TP_15) / (float(self.TP_15) + self.FP_15)
+
+        if (float(self.TP_15) + self.FN_15) > 0:
+            recall_15 = float(self.TP_15) / (float(self.TP_15) + self.FN_15)
+
+        if (float(self.TP_10) + self.FP_10) >0:
+            precision_10 = float(self.TP_10) / (float(self.TP_10) + self.FP_10)
+
+        if (float(self.TP_10) + self.FN_10) > 0:
+            recall_10 = float(self.TP_10) / (float(self.TP_10) + self.FN_10)
+
+        if (float(self.TP_5) + self.FP_5) >0:
+            precision_5 = float(self.TP_5) / (float(self.TP_5) + self.FP_5)
+
+        if (float(self.TP_5) + self.FN_5) > 0:
+            recall_5 = float(self.TP_5) / (float(self.TP_5) + self.FN_5)
+
+        local_output = ''
+        # 20
+        local_output += 'TP_15: {}\n'.format(self.TP_15) + 'FN_15: {}\n'.format(self.FN_15) + \
+                        'FP_15: {}\n'.format(self.FP_15)
+        if precision_15 and recall_15:
+            local_output += 'Precision_15: {}\n'.format(precision_15) + 'Recall_15: {}\n'.format(recall_15) + '\n'
+
+        # 10
+        local_output += 'TP_10: {}\n'.format(self.TP_10) + 'FN_10: {}\n'.format(self.FN_10) + \
+                        'FP_10: {}\n'.format(self.FP_10)
+        if precision_10 and recall_10:
+            local_output += 'Precision_10: {}\n'.format(precision_10) + 'Recall_10: {}\n'.format(recall_10) + '\n'
+
+        # 5
+        local_output += 'TP_5: {}\n'.format(self.TP_5) + 'FN_5: {}\n'.format(self.FN_5) + \
+                        'FP_5: {}\n'.format(self.FP_5)
+        if precision_5 and recall_5:
+            local_output += 'Precision_5: {}\n'.format(precision_5) + 'Recall_5: {}\n'.format(recall_5) + '\n'
+
+        precision_15 = recall_15 = precision_10 = recall_10 = precision_5 = recall_5 = 0
+
+        if (float(self.global_TP_15) + self.global_FP_15) >0:
+            precision_15 = float(self.global_TP_15) / (float(self.global_TP_15) + self.global_FP_15)
+
+        if (float(self.global_TP_15) + self.global_FN_15) > 0:
+            recall_15 = float(self.global_TP_15) / (float(self.global_TP_15) + self.global_FN_15)
+
+        if (float(self.global_TP_10) + self.global_FP_10) >0:
+            precision_10 = float(self.global_TP_10) / (float(self.global_TP_10) + self.global_FP_10)
+
+        if (float(self.global_TP_10) + self.global_FN_10) > 0:
+            recall_10 = float(self.global_TP_10) / (float(self.global_TP_10) + self.global_FN_10)
+
+        if (float(self.global_TP_5) + self.global_FP_5) >0:
+            precision_5 = float(self.global_TP_5) / (float(self.global_TP_5) + self.global_FP_5)
+
+        if (float(self.global_TP_5) + self.global_FN_5) > 0:
+            recall_5 = float(self.global_TP_5) / (float(self.global_TP_5) + self.global_FN_5)
+
+
+        global_output = ''
+        # 20
+        global_output += 'global_TP_15: {}\n'.format(self.global_TP_15) + 'global_FN_15: {}\n'.format(self.global_FN_15) + \
+                        'global_FP_15: {}\n'.format(self.global_FP_15)
+        if precision_15 and recall_15:
+            global_output += 'Precision_15: {}\n'.format(precision_15) + 'Recall_15: {}\n'.format(recall_15) + '\n'
+
+        # 10
+        global_output += 'global_TP_10: {}\n'.format(self.global_TP_10) + 'global_FN_10: {}\n'.format(self.global_FN_10) + \
+                        'global_FP_10: {}\n'.format(self.global_FP_10)
+        if precision_10 and recall_10:
+            global_output += 'Precision_10: {}\n'.format(precision_10) + 'Recall_10: {}\n'.format(recall_10) + '\n'
+
+        # 5
+        global_output += 'global_TP_5: {}\n'.format(self.global_TP_5) + 'global_FN_5: {}\n'.format(self.global_FN_5) + \
+                        'global_FP_5: {}\n'.format(self.global_FP_5)
+        if precision_5 and recall_5:
+            global_output += 'Precision_5: {}\n'.format(precision_5) + 'Recall_5: {}\n'.format(recall_5) + '\n'
+
+        global_output += '{}/{} received images.\n'.format(self.subscribe_counter, self.publish_counter)
+        global_output += '{}/{} received images processed.'.format(self.processed_images, self.subscribe_counter)
+        global_output += 'lost images: {}'.format(self.lost_images)
+
+        filename = self.image_output_dir + '/results.txt'
+        if os.path.exists(filename):
+            append_write = 'a' # append if already exists
+        else:
+            append_write = 'w' # make a new file if not
+
+        with open(filename,append_write) as file:
+            file.write(self.current_relative_dir + '\n' + local_output + '\n')
+            file.write('Global:\n' + global_output + '\n\n')
+        #rospy.loginfo('Saved metric results.')
+
+
+
+    def _fetch_test_data(self):
+        rospy.loginfo('Fetching test_data from {}..'.format(self.current_dir))
+        all_images = glob.glob(self.current_dir + "/*.png")
+        if not all_images:
+            all_images = glob.glob(self.current_dir + "/*.jpg")
+        assert len(all_images) > 0
+        for image_filename in all_images:
+            annotation_filename = image_filename[:-3] + "json"
+            if os.path.exists(annotation_filename):
+                self.test_data.update({image_filename : annotation_filename})
+        rospy.loginfo('Fetched {} images.'.format(len(all_images)))
+
+
+    def _read_cam_info(self):
+        #rospy.loginfo('Read Camera_info..')
+        camera_namespace = rospy.get_param('camera', 'dope/webcam')
+        camera_info_url = rospy.get_param('~camera_info_url',
+                                          'file:///home/benjamin/catkin_ws/src/dope/config/camera_info_gauge.yaml')
+        self.info_manager = CameraInfoManager(cname='dope_webcam_{}'.format(0),
+                                         namespace=camera_namespace)
+        try:
+            if not self.info_manager.setURL(camera_info_url):
+                raise RuntimeError('Camera info URL invalid: %s', camera_info_url)
+        except KeyError:
+            # we don't have a camera_info_url, so we'll keep the
+            # default ('file://${ROS_HOME}/camera_info/${NAME}.yaml')
+            pass
+
+        self.info_manager.loadCameraInfo()
+        if not self.info_manager.isCalibrated():
+            raise RuntimeError('Camera is not calibrated, please supply a valid camera_info_url parameter!')
+        self.camera_info = self.info_manager.getCameraInfo()
+
+    def _process_image(self):
+        assert self.images
+        for frame_id, image in self.images.items():
+            if frame_id in self.detections and frame_id in self.cuboids:
+                rospy.logdebug('{} is complete!'.format(frame_id))
+                self.processed_images += 1
+                self.lost_images.remove(frame_id)
+
+                #annotation = self.load_annotation_file(frame_id)
+                #gt_cuboids = [object['projected_cuboid'] for object in annotation['objects']]
+                #estimated_cuboids =  self.cuboids.get(frame_id).cuboids
+
+                #closest_cuboid_list = self.get_closest_cuboids(gt_cuboids, estimated_cuboids)
+
+                # count TP, FN, FP
+                self._process_cuboids_in_image(frame_id)
+
+                self.save_image(image,self.cuboids.get(frame_id), self.detections.get(frame_id))
+
+                del self.images[frame_id]
+                del self.cuboids[frame_id]
+                del self.detections[frame_id]
+                #rospy.logdebug(self.get_result())
+                #rospy.logdebug(self.get_result(total=True))
+
+    def _process_cuboids_in_image(self, frame_id):
+
+        annotation = self.load_annotation_file(frame_id)
+        gt_cuboids = [object['projected_cuboid'] for object in annotation['objects']]
+        estimated_cuboids = self.cuboids.get(frame_id).cuboids
+        if not estimated_cuboids:
+            self.FN_5 += len(gt_cuboids)
+            self.FN_10 += len(gt_cuboids)
+            self.FN_15 += len(gt_cuboids)
+            return
+
+        #rospy.logdebug('gt_cuboids on frame {}: {}'.format(frame_id, len(gt_cuboids)))
+        #rospy.logdebug('estimated_cuboids on frame {}: {}'.format(frame_id, len(estimated_cuboids)))
+
+        closest_cuboid_list, matrix = self.get_closest_cuboids(gt_cuboids, estimated_cuboids)
+
+        #rospy.logdebug('Cost_Matrix: {}'.format(matrix))
+        #rospy.logdebug(closest_cuboid_list)
+        #print_matrix(matrix)
+        #for row, column in closest_cuboid_list:
+        #    value = matrix[row][column]
+        #    rospy.logdebug('({}, {}) -> {}'.format(row, column, value))
+
+        # Distance Munkres Matrix
+        # [ 330,   0]
+        # [ 330,   0]
+        # [   0, 330]
+        #
+        # (0, 1) -> 0.0 estimated_cuboid 0 is close to gt_cuboid 1, Distance is 0
+        # (2, 0) -> 0.0
+
+        # add true positive and false positive
+        left_value_list  = []
+        right_value_list = []
+        for estimation_cuboid_id, gt_cuboid_id in closest_cuboid_list:
+            # for an estimated cuboid there was no a ground truth cuboid (more estimations, than ground truths, very unlikely)
+
+            add2d_distance = matrix[estimation_cuboid_id][gt_cuboid_id]
+            bounding_box_diameter = self.get_cuboid_2d_diameter(gt_cuboids[gt_cuboid_id])
+            if add2d_distance < (0.15 * bounding_box_diameter):
+                self.TP_15 += 1
+            else:
+                self.FP_15 += 1
+
+            if add2d_distance < (0.1 * bounding_box_diameter):
+                self.TP_10 += 1
+            else:
+                self.FP_10 += 1
+
+            if add2d_distance < (0.05 * bounding_box_diameter):
+                self.TP_5 += 1
+            else:
+                self.FP_5 += 1
+
+            # what right value and left value of tuple came up?
+            left_value_list.append(estimation_cuboid_id)
+            right_value_list.append(gt_cuboid_id)
+
+        # add false negative
+        # cuboid_id is not present on the right sight of the tuple
+        # --> there was no estimation for a ground truth cuboid
+        for gt_id in range(len(gt_cuboids)):
+            if gt_id not in right_value_list:
+                #rospy.loginfo('FN: Ground truth cuboid {} was not estimated'.format(gt_id))
+                self.FN_5 += 1
+                self.FN_10 += 1
+                self.FN_15 += 1
+        for estimate_id in range(len(estimated_cuboids)):
+            if estimate_id not in left_value_list:
+                #rospy.loginfo('FP: Estimated cuboid was not assigned to a ground truth (more estimations, than ground truths)')
+                self.FP_5 += 1
+                self.FP_10 += 1
+                self.FP_15 += 1
+
+        #rospy.logdebug('')
+        #rospy.logdebug('')
+        #rospy.logdebug('TP_15: {}'.format(self.TP_15))
+        #rospy.logdebug('FN_15: {}'.format(self.FN_15))
+        #rospy.logdebug('FP_15: {}'.format(self.FP_15))
+        #rospy.logdebug('PRECISION_th20: {}'.format(float(self.TP_15) / (float(self.TP_15) + self.FP_15)))
+        #rospy.logdebug('RECALL_th20: {}'.format(float(self.TP_15) / (float(self.TP_15) + self.FN_15)))
+        #rospy.logdebug('')
+        #rospy.logdebug('TP_10: {}'.format(float(self.TP_10)))
+        #rospy.logdebug('FN_10: {}'.format(self.FN_10))
+        #rospy.logdebug('FP_10: {}'.format(self.FP_10))
+        #rospy.logdebug('PRECISION_th10: {}'.format(float(self.TP_10) / (float(self.TP_10) + self.FP_10)))
+        #rospy.logdebug('RECALL_th10: {}'.format(float(self.TP_10) / (float(self.TP_10) + self.FN_10)))
+        #rospy.logdebug('')
+        #rospy.logdebug('TP_5: {}'.format(float(self.TP_5)))
+        #rospy.logdebug('FN_5: {}'.format(self.FN_5))
+        #rospy.logdebug('FP_5: {}'.format(self.FP_5))
+        #rospy.logdebug('PRECISION_th5: {}'.format(float(self.TP_5) / (float(self.TP_5) + self.FP_5)))
+        #rospy.logdebug('RECALL_th5: {}'.format(float(self.TP_5) / (float(self.TP_5) + self.FN_5)))
+        #rospy.logdebug('')
+        #rospy.logdebug('')
+
+
+    def get_cuboid_2d_diameter(self, cuboid):
+        x_max = y_max = 0
+        x_min = y_min = 1000
+        for point in cuboid:
+            if point[0] > x_max:
+                x_max = point[0]
+            if point[0] < x_min:
+                x_min = point[0]
+            if point[1] > y_max:
+                y_max = point[1]
+            if point[1] > y_min:
+                y_min = point[1]
+
+        return math.sqrt((x_max - x_min)**2 + (y_max - y_min)**2)
+
+
+    def get_closest_cuboids(self, gt_cuboids, estimated_cuboids):
+        matrix = self.get_cost_matrix(gt_cuboids, estimated_cuboids )
+        #padded_matrix = self.munkres.pad_matrix(matrix, pad_value=1000)
+        return self.munkres.compute(matrix), matrix
+
+    def get_cost_matrix(self, gt_cuboids, estimated_cuboids):
+        #cost_matrix = np.zeros(shape=(len(gt_cuboids), ), dtype=float,)
+        cost_matrix = [[0 for x in range(len(gt_cuboids))] for y in range(len(estimated_cuboids))]
+        for i, estimated_cuboid in enumerate(estimated_cuboids):
+            for j, gt_cuboid in enumerate(gt_cuboids):
+                cost_matrix[i][j] = self.calculate_ADD_2D(gt_cuboid,estimated_cuboid)
+        return cost_matrix
+
+    def calculate_ADD_2D(self, gt_cuboid, estimated_cuboid):
+
+        if len(estimated_cuboid.points) == 9:
+            # remove last point since it is the centroid
+            estimated_cuboid.points = estimated_cuboid.points[:-1]
+
+        number_of_cuboid_points = 8
+        assert len(gt_cuboid) == number_of_cuboid_points
+        assert len(estimated_cuboid.points) == number_of_cuboid_points, 'Number of Points:{} != 8: {}'.format(len(estimated_cuboid.points), estimated_cuboid.points)
+        sum_distance = 0.0
+        for i in range(number_of_cuboid_points):
+            sum_distance += math.sqrt((( gt_cuboid[i][0]-estimated_cuboid.points[i].x)**2)+
+                                      ((gt_cuboid[i][1]-estimated_cuboid.points[i].y)**2) )
+        return (float(sum_distance) /  float(number_of_cuboid_points))
+
+    def load_annotation_file(self, id):
+        with open(self.current_dir + '/' + str(id) + '.json') as json_file:
+            gt_annotation = json.load(json_file)
+        return gt_annotation
+
+    def save_image(self,image, cuboids, detections):
+        try:
+            image_id = image.header.frame_id
+            cv2_img = self.bridge.imgmsg_to_cv2(image, "bgr8")
+        except CvBridgeError as e:
+            print(e)
+        else:
+            #final_img = self.draw_cuboids_on_image(image=cv2_img,
+            #                                       cuboids=cuboids,
+            #                                       detections=detections)
+            final_img = cv2_img
+            # Save your OpenCV2 image as a png
+            filename = self.image_output_dir + '/' + self.current_relative_dir + '/' + str(image_id) + '.png'
+            #rospy.logdebug('Save image to {}'.format(filename))
+            cv2.imwrite(filename, final_img)
+            assert os.path.isfile(filename), 'No file: {}'.format(filename)
+            self.rate.sleep()
+
+
+    def draw_cuboids_on_image(self, image, cuboids, detections):
+
+        for cuboid in cuboids.cuboids:
+            points = [(int(point.x), int(point.y)) for point in cuboid.points]
+
+            #front
+            cv2.line(image, points[0], points[1], (0, 0, 255), 3)
+            cv2.line(image, points[1], points[2], (0, 0, 255), 3)
+            cv2.line(image, points[2], points[3], (0, 0, 255), 3)
+            cv2.line(image, points[3], points[0], (0, 0, 255), 3)
+
+            #back                                           
+            cv2.line(image, points[4], points[5], (0, 0, 255), 3)
+            cv2.line(image, points[5], points[6], (0, 0, 255), 3)
+            cv2.line(image, points[6], points[7], (0, 0, 255), 3)
+            cv2.line(image, points[7], points[4], (0, 0, 255), 3)
+
+            #connecting faces
+            cv2.line(image, points[0], points[4], (0, 0, 255), 3)
+            cv2.line(image, points[1], points[5], (0, 0, 255), 3)
+            cv2.line(image, points[2], points[6], (0, 0, 255), 3)
+            cv2.line(image, points[3], points[7], (0, 0, 255), 3)
+
+            # cross on top
+            cv2.line(image, points[0], points[5], (0, 0, 255), 3)
+            cv2.line(image, points[1], points[4], (0, 0, 255), 3)
+        return image
+
+    def drain(self, q):
+        i = 0
+        while True:
+            if i > 10:
+                break
+            try:
+                yield q.get_nowait()
+            except queue.Empty:  # on python 2 use Queue.Empty
+                break
+            i += 1
+
+    def empty_queues(self):
+        for image in self.drain(self.image_que):
+            self.images[image.header.frame_id] = image
+            assert self.images
+
+        for detection in self.drain(self.detection_que):
+            self.detections.update({detection.header.frame_id : detection})
+            assert self.detections
+
+        for cuboid in self.drain(self.cuboid_que):
+            self.cuboids.update({cuboid.header.frame_id : cuboid})
+            assert self.cuboids
+
+
+    def _image_callback(self, msg):
+        self.image_que.put(msg)
+        assert self.image_que.qsize() > 0
+        self.subscribe_counter += 1
+        rospy.logdebug("Received image: {}".format(str(msg.header.frame_id)))
+
+    def _cuboid_callback(self,msg):
+        self.cuboid_que.put(msg)
+        rospy.logdebug("Received cuboid: {}".format(str(msg.header.frame_id)))
+
+    def _detection_callback(self, msg):
+        self.detection_que.put(msg)
+        rospy.logdebug("Received detection: {}".format(str(msg.header.frame_id)))
+
+    def _caluclate_ADDS(self, ground_truth, inference):
+        pass
+
+
+if __name__ == "__main__":
+    # Initialize ROS node
+    rospy.loginfo('Init Gauge..')
+
+
+    try:
+        rospy.init_node('dope_performance_gauge', anonymous=True,
+                        log_level=rospy.DEBUG)
+        DopePerformanceGauge().run()
+        rospy.spin()
+
+    except rospy.ROSInterruptException:
+        pass
+    else:
+        rospy.loginfo('\nFinished Dataset.\n')
+
